@@ -14,139 +14,54 @@ st.set_page_config(page_title="Melody & Harmony from YouTube", page_icon="🎵")
 # ------------------------
 # Utilities
 # ------------------------
-def download_audio_from_youtube(url: str) -> str:
+def download_audio_from_youtube(url: str, max_seconds: int = 60) -> str:
     """
-    Download audio from YouTube and convert to 44.1kHz mono WAV via ffmpeg.
-    Use only for your own/authorized content.
+    YouTubeの音声を「先頭 max_seconds 秒だけ」FFmpegでストリーム抽出してWAV化します。
+    → 全編ダウンロードしないので、無料枠でもタイムアウトしづらい方式。
     """
+    import tempfile, os, subprocess
+    from yt_dlp import YoutubeDL
+
     tmpdir = tempfile.mkdtemp(prefix="yt_")
+    wav = os.path.join(tmpdir, "audio.wav")
+
+    # 1) メタだけ取得（ダウンロードしない）
     ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(tmpdir, "audio.%(ext)s"),
         "quiet": True,
         "noprogress": True,
+        "skip_download": True,
+        "format": "bestaudio/best",
     }
     with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    files = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir)]
-    if not files:
-        raise RuntimeError("音声の取得に失敗しました。URL/公開設定をご確認ください。")
-    src = files[0]
-    wav = os.path.join(tmpdir, "audio.wav")
-    cmd = ["ffmpeg","-y","-i",src,"-ac","1","-ar","44100",wav]
-    ret = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if ret.returncode != 0:
-        raise RuntimeError("ffmpegの変換に失敗しました（ログを確認）。")
-    return wav
-
-def segment_notes(times, f0, min_note_ms=120.0):
-    min_note_s = min_note_ms / 1000.0
-    segs = []
-    cur_pitch = None
-    cur_start = None
-
-    def flush(idx):
-        nonlocal cur_pitch, cur_start
-        if cur_pitch is None or cur_start is None:
-            return
-        start_t = cur_start
-        end_t = times[idx] if idx < len(times) else times[-1]
-        dur = max(0.0, end_t - start_t)
-        if dur >= min_note_s:
-            segs.append({"t": float(start_t), "dur": float(dur), "hz": float(cur_pitch)})
-        cur_pitch = None
-        cur_start = None
-
-    for i, hz in enumerate(f0):
-        if np.isnan(hz):
-            if cur_pitch is not None:
-                flush(i)
-            continue
-        midi_pitch = np.round(librosa.hz_to_midi(hz))
-        if cur_pitch is None:
-            cur_pitch = librosa.midi_to_hz(midi_pitch)
-            cur_start = times[i]
+        info = ydl.extract_info(url, download=False)
+        # ベスト音声の実URLを選ぶ
+        if "url" in info:  # 単一フォーマットの場合
+            src_url = info["url"]
         else:
-            prev_midi = librosa.hz_to_midi(cur_pitch)
-            if abs(midi_pitch - prev_midi) <= 0.5:
-                pass
-            else:
-                flush(i)
-                cur_pitch = librosa.midi_to_hz(midi_pitch)
-                cur_start = times[i]
-    flush(len(times) - 1)
-    return segs
+            # 複数フォーマットの場合は音声優先のbestを探す
+            fmts = info.get("formats", [])
+            audio_fmts = [f for f in fmts if f.get("acodec") != "none"]
+            if not audio_fmts:
+                raise RuntimeError("音声フォーマットが見つかりませんでした。")
+            # 最大ビットレートのものを選ぶ
+            src_url = sorted(audio_fmts, key=lambda f: f.get("abr") or 0, reverse=True)[0]["url"]
 
-def build_key(key_text):
-    name, mode = key_text.split()
-    return m21key.Key(name, mode)
+    # 2) FFmpegで先頭 max_seconds 秒だけ取り込み（44100Hz mono）
+    #    ※HTTPストリームをそのまま読むので全編DL不要
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", "0", "-t", str(int(max_seconds)),
+        "-i", src_url,
+        "-ac", "1", "-ar", "44100",
+        wav
+    ]
+    ret = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    if ret.returncode != 0 or (not os.path.exists(wav)):
+        # ログを出したい場合は以下を有効化:
+        # print(ret.stderr.decode("utf-8", errors="ignore"))
+        raise RuntimeError("YouTube音声の抽出に失敗しました。動画の公開設定/地域制限/年齢制限をご確認ください。")
 
-def diatonic_shift_midi(midi_pitch, m21_key, steps):
-    n = note.Note()
-    n.pitch.midi = midi_pitch
-    deg = m21_key.getScaleDegreeFromPitch(n.pitch)
-    if deg is None:
-        candidates = []
-        for d in range(1, 8):
-            p = m21_key.pitchFromDegree(d)
-            for off in [-24,-12,0,12,24]:
-                nn = note.Note(p)
-                nn.pitch.midi += off
-                candidates.append(nn.pitch.midi)
-        n.pitch.midi = min(candidates, key=lambda x: abs(x - midi_pitch))
-        deg = m21_key.getScaleDegreeFromPitch(n.pitch)
-    target_deg = ((deg - 1 + steps) % 7) + 1
-    tp = m21_key.pitchFromDegree(target_deg)
-    tn = note.Note(tp)
-    while tn.pitch.midi > midi_pitch + 7:
-        tn.pitch.midi -= 12
-    while tn.pitch.midi < midi_pitch - 12:
-        tn.pitch.midi += 12
-    return tn.pitch.midi
-
-def notes_to_score(notes, bpm, key_text, harmony_steps):
-    sc = stream.Score()
-    sc.insert(0, metadata.Metadata())
-    sc.metadata.title = "Melody & Harmony (YouTube)"
-    kp = build_key(key_text)
-    ts = meter.TimeSignature('4/4')
-    tp = tempo.MetronomeMark(number=bpm)
-
-    part_m = stream.Part(id="Melody")
-    part_h = stream.Part(id="Harmony")
-    for p in (part_m, part_h):
-        p.insert(0, kp); p.insert(0, ts); p.insert(0, tp)
-
-    sec_per_beat = 60.0 / max(bpm, 1.0)
-    mel_rows, harm_rows = [], []
-
-    for seg in notes:
-        midi_pitch = int(np.round(librosa.hz_to_midi(seg["hz"])))
-        dur_q = max(seg["dur"] / sec_per_beat, 0.25)
-        nm = note.Note()
-        nm.pitch.midi = midi_pitch
-        nm.duration = duration.Duration(dur_q)
-        part_m.append(nm)
-        mel_rows.append({"t": seg["t"], "dur": seg["dur"], "note": nm.nameWithOctave, "midi": midi_pitch})
-
-        hm = note.Note()
-        hm.pitch.midi = diatonic_shift_midi(midi_pitch, kp, harmony_steps)
-        hm.duration = duration.Duration(dur_q)
-        part_h.append(hm)
-        harm_rows.append({"t": seg["t"], "dur": seg["dur"], "note": hm.nameWithOctave, "midi": hm.pitch.midi})
-
-    sc.append(part_m); sc.append(part_h)
-    return sc, mel_rows, harm_rows
-
-def export_midi(score):
-    mf = midi.translate.streamToMidiFile(score)
-    bio = BytesIO()
-    mf.open(bio); mf.write(); mf.close()
-    bio.seek(0); return bio.read()
-
-def export_musicxml(score):
-    fp = score.write('musicxml')
-    with open(fp,'rb') as f: return f.read()
+    return wav
 
 # ------------------------
 # UI
