@@ -431,10 +431,13 @@ if btn:
                 pos += length
             return normalize_audio(out)
 
-        if st.button("（デモ）提案ハモリを合成して試聴"):
-            with st.spinner("生成中..."):
-                synth = synth_from_midi(harm, sr=22050)
-            st.audio(sf.write(io.BytesIO(), synth, 22050, format="WAV") or io.BytesIO(), format="audio/wav")
+      if st.button("（デモ）提案ハモリを合成して試聴"):
+    with st.spinner("生成中..."):
+        synth = synth_from_midi(harm, sr=22050)
+        buf = io.BytesIO()
+        sf.write(buf, synth, 22050, format="WAV")
+        buf.seek(0)
+    st.audio(buf, format="audio/wav")
 
     # --- データ出力
     with tabs[4]:
