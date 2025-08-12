@@ -227,5 +227,6 @@ if audio_path:
         st.subheader("コード進行タイムライン")
         # 10秒以上続くコードのみ強調（ノイズ抑制）
         tl = result["chords"].copy()
-       tl["label"] = tl["chord"] + "  (" + tl["dur]()
+       tl["label"] = tl["chord"] + " (" + str(tl["dur"]()) + ")"
+
 
